@@ -1,0 +1,410 @@
+#!/bin/bash
+# ==============================================================================
+# S2I assemble script for Java 17
+# Supports: Maven, Gradle, Maven Wrapper, Gradle Wrapper, binary deployments
+# Features: Aliyun mirror by default, aggressive cleanup for lean images
+# ==============================================================================
+set -eo pipefail
+
+S2I_SOURCE_DIR="${S2I_SOURCE_DIR:-/tmp/src}"
+S2I_ARTIFACTS_DIR="${S2I_ARTIFACTS_DIR:-/tmp/artifacts}"
+S2I_TARGET_DEPLOYMENTS_DIR="${S2I_TARGET_DEPLOYMENTS_DIR:-/deployments}"
+MAVEN_LOCAL_REPO="${MAVEN_LOCAL_REPO:-${S2I_ARTIFACTS_DIR}/m2}"
+GRADLE_USER_HOME="${GRADLE_USER_HOME:-${S2I_ARTIFACTS_DIR}/.gradle}"
+MAVEN_S2I_GOALS="${MAVEN_S2I_GOALS:-clean package}"
+GRADLE_S2I_TASKS="${GRADLE_S2I_TASKS:-clean build}"
+MAVEN_S2I_ARTIFACT_DIRS="${MAVEN_S2I_ARTIFACT_DIRS:-target}"
+
+# Aliyun Maven mirror (default, can be overridden)
+MAVEN_MIRROR_URL="${MAVEN_MIRROR_URL:-https://maven.aliyun.com/repository/public}"
+MAVEN_MIRROR_OF="${MAVEN_MIRROR_OF:-central}"
+
+log_info()  { echo "---> [INFO] $*"; }
+log_warn()  { echo "---> [WARN] $*" >&2; }
+log_error() { echo "---> [ERROR] $*" >&2; }
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+generate_maven_settings() {
+    local settings_file="$1"
+    cat > "${settings_file}" <<SETTINGS_XML
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                              http://maven.apache.org/xsd/settings-1.0.0.xsd">
+  <mirrors>
+    <mirror>
+      <id>aliyun-mirror</id>
+      <url>${MAVEN_MIRROR_URL}</url>
+      <mirrorOf>${MAVEN_MIRROR_OF}</mirrorOf>
+    </mirror>
+  </mirrors>
+</settings>
+SETTINGS_XML
+    log_info "Maven mirror configured: ${MAVEN_MIRROR_URL}"
+}
+
+# ============================================================================
+# Build functions
+# ============================================================================
+
+build_maven() {
+    local build_dir="${1:-${S2I_SOURCE_DIR}}"
+    local goals="${MAVEN_S2I_GOALS}"
+
+    log_info "Performing Maven build..."
+    log_info "  Goals: ${goals}"
+    log_info "  Java: $(java -version 2>&1 | head -1)"
+    log_info "  Maven: $(mvn --version 2>&1 | head -1)"
+
+    local maven_args="-e --batch-mode -Djava.net.preferIPv4Stack=true"
+    maven_args="${maven_args} -Dmaven.repo.local=${MAVEN_LOCAL_REPO}"
+
+    # Always configure mirror (Aliyun by default)
+    local settings_file="/tmp/s2i-maven-settings.xml"
+    generate_maven_settings "${settings_file}"
+    maven_args="${maven_args} -s ${settings_file}"
+
+    if [ -n "${MAVEN_ARGS}" ]; then
+        maven_args="${MAVEN_ARGS}"
+    fi
+    if [ -n "${MAVEN_ARGS_APPEND}" ]; then
+        maven_args="${maven_args} ${MAVEN_ARGS_APPEND}"
+    fi
+
+    if [ -z "${MAVEN_OPTS}" ]; then
+        export MAVEN_OPTS="-XX:MaxRAMPercentage=50.0"
+    fi
+    log_info "  MAVEN_OPTS: ${MAVEN_OPTS}"
+
+    pushd "${build_dir}" > /dev/null
+    log_info "Running: mvn ${maven_args} ${goals}"
+    mvn ${maven_args} ${goals}
+    popd > /dev/null
+
+    copy_maven_artifacts "${build_dir}"
+}
+
+build_maven_wrapper() {
+    local build_dir="${1:-${S2I_SOURCE_DIR}}"
+    local goals="${MAVEN_S2I_GOALS}"
+
+    log_info "Performing Maven Wrapper build..."
+    log_info "  Goals: ${goals}"
+
+    local mvnw="${build_dir}/mvnw"
+    chmod +x "${mvnw}"
+
+    local maven_args="-e --batch-mode -Djava.net.preferIPv4Stack=true"
+    maven_args="${maven_args} -Dmaven.repo.local=${MAVEN_LOCAL_REPO}"
+
+    local settings_file="/tmp/s2i-maven-settings.xml"
+    generate_maven_settings "${settings_file}"
+    maven_args="${maven_args} -s ${settings_file}"
+
+    if [ -n "${MAVEN_ARGS}" ]; then
+        maven_args="${MAVEN_ARGS}"
+    fi
+    if [ -n "${MAVEN_ARGS_APPEND}" ]; then
+        maven_args="${maven_args} ${MAVEN_ARGS_APPEND}"
+    fi
+
+    if [ -z "${MAVEN_OPTS}" ]; then
+        export MAVEN_OPTS="-XX:MaxRAMPercentage=50.0"
+    fi
+
+    pushd "${build_dir}" > /dev/null
+    log_info "Running: ./mvnw ${maven_args} ${goals}"
+    ./mvnw ${maven_args} ${goals}
+    popd > /dev/null
+
+    copy_maven_artifacts "${build_dir}"
+}
+
+build_gradle() {
+    local build_dir="${1:-${S2I_SOURCE_DIR}}"
+    local tasks="${GRADLE_S2I_TASKS}"
+
+    log_info "Performing Gradle build..."
+    log_info "  Tasks: ${tasks}"
+    log_info "  Java: $(java -version 2>&1 | head -1)"
+    log_info "  Gradle: $(gradle --version 2>&1 | grep 'Gradle ' | head -1)"
+
+    # Aliyun mirror is pre-configured in /opt/gradle/init.d/
+    local gradle_args="--no-daemon --stacktrace"
+    if [ -n "${GRADLE_ARGS}" ]; then
+        gradle_args="${GRADLE_ARGS}"
+    fi
+    if [ -n "${GRADLE_ARGS_APPEND}" ]; then
+        gradle_args="${gradle_args} ${GRADLE_ARGS_APPEND}"
+    fi
+
+    export GRADLE_USER_HOME
+    mkdir -p "${GRADLE_USER_HOME}"
+
+    pushd "${build_dir}" > /dev/null
+    log_info "Running: gradle ${gradle_args} ${tasks}"
+    gradle ${gradle_args} ${tasks}
+    popd > /dev/null
+
+    copy_gradle_artifacts "${build_dir}"
+}
+
+build_gradle_wrapper() {
+    local build_dir="${1:-${S2I_SOURCE_DIR}}"
+    local tasks="${GRADLE_S2I_TASKS}"
+
+    log_info "Performing Gradle Wrapper build..."
+    log_info "  Tasks: ${tasks}"
+
+    local gradlew="${build_dir}/gradlew"
+    chmod +x "${gradlew}"
+
+    local gradle_args="--no-daemon --stacktrace"
+    if [ -n "${GRADLE_ARGS}" ]; then
+        gradle_args="${GRADLE_ARGS}"
+    fi
+    if [ -n "${GRADLE_ARGS_APPEND}" ]; then
+        gradle_args="${gradle_args} ${GRADLE_ARGS_APPEND}"
+    fi
+
+    export GRADLE_USER_HOME
+    mkdir -p "${GRADLE_USER_HOME}"
+
+    pushd "${build_dir}" > /dev/null
+    log_info "Running: ./gradlew ${gradle_args} ${tasks}"
+    ./gradlew ${gradle_args} ${tasks}
+    popd > /dev/null
+
+    copy_gradle_artifacts "${build_dir}"
+}
+
+# ============================================================================
+# Artifact copying
+# ============================================================================
+
+copy_maven_artifacts() {
+    local build_dir="$1"
+    local count=0
+
+    IFS=',' read -ra DIRS <<< "${MAVEN_S2I_ARTIFACT_DIRS}"
+    for dir in "${DIRS[@]}"; do
+        dir=$(echo "${dir}" | xargs)
+        local artifact_dir="${build_dir}/${dir}"
+        if [ -d "${artifact_dir}" ]; then
+            for jar in "${artifact_dir}"/*.jar; do
+                [ -f "${jar}" ] || continue
+                local basename=$(basename "${jar}")
+                case "${basename}" in
+                    original-*|*-sources.jar|*-javadoc.jar) continue ;;
+                esac
+                cp "${jar}" "${S2I_TARGET_DEPLOYMENTS_DIR}/"
+                log_info "Copied artifact: ${basename}"
+                count=$((count + 1))
+            done
+            for war in "${artifact_dir}"/*.war; do
+                [ -f "${war}" ] || continue
+                cp "${war}" "${S2I_TARGET_DEPLOYMENTS_DIR}/"
+                log_info "Copied artifact: $(basename ${war})"
+                count=$((count + 1))
+            done
+        fi
+    done
+
+    if [ ${count} -eq 0 ]; then
+        log_warn "No deployable artifacts found in Maven output directories"
+    fi
+}
+
+copy_gradle_artifacts() {
+    local build_dir="$1"
+    local libs_dir="${build_dir}/build/libs"
+    local count=0
+
+    if [ -d "${libs_dir}" ]; then
+        for jar in "${libs_dir}"/*.jar; do
+            [ -f "${jar}" ] || continue
+            local basename=$(basename "${jar}")
+            case "${basename}" in
+                *-plain.jar|*-sources.jar|*-javadoc.jar) continue ;;
+            esac
+            cp "${jar}" "${S2I_TARGET_DEPLOYMENTS_DIR}/"
+            log_info "Copied artifact: ${basename}"
+            count=$((count + 1))
+        done
+    fi
+
+    if [ ${count} -eq 0 ]; then
+        log_warn "No deployable artifacts found in build/libs"
+    fi
+}
+
+deploy_binaries() {
+    local count=0
+    log_info "Copying pre-built JAR/WAR files to deployments..."
+
+    while IFS= read -r -d '' file; do
+        cp "${file}" "${S2I_TARGET_DEPLOYMENTS_DIR}/"
+        log_info "Copied binary: $(basename ${file})"
+        count=$((count + 1))
+    done < <(find "${S2I_SOURCE_DIR}" -maxdepth 2 \( -name "*.jar" -o -name "*.war" \) -print0)
+
+    if [ ${count} -eq 0 ]; then
+        log_warn "No JAR/WAR files found in source directory"
+    fi
+}
+
+# ============================================================================
+# Cleanup functions - KEY for lean images
+# ============================================================================
+
+copy_configuration() {
+    local config_dir="${S2I_SOURCE_DIR}/configuration"
+    if [ -d "${config_dir}" ]; then
+        log_info "Copying configuration files..."
+        cp -rp "${config_dir}"/* "${S2I_TARGET_DEPLOYMENTS_DIR}/" 2>/dev/null || true
+    fi
+}
+
+cleanup_maven_build_artifacts() {
+    log_info "Cleaning Maven build artifacts..."
+    local build_dir="${1:-${S2I_SOURCE_DIR}}"
+
+    IFS=',' read -ra DIRS <<< "${MAVEN_S2I_ARTIFACT_DIRS}"
+    for dir in "${DIRS[@]}"; do
+        dir=$(echo "${dir}" | xargs)
+        rm -rf "${build_dir}/${dir}" 2>/dev/null || true
+    done
+}
+
+cleanup_gradle_build_artifacts() {
+    log_info "Cleaning Gradle build artifacts..."
+    local build_dir="${1:-${S2I_SOURCE_DIR}}"
+
+    rm -rf "${build_dir}/build" 2>/dev/null || true
+    rm -rf "${build_dir}/.gradle" 2>/dev/null || true
+}
+
+cleanup_build_cache() {
+    log_info "Cleaning build tool caches to reduce image size..."
+
+    # Clean Maven local repo
+    if [ "${MAVEN_CLEAR_REPO}" = "true" ] || [ "${S2I_ENABLE_INCREMENTAL_BUILDS}" != "true" ]; then
+        log_info "  Removing Maven local repository..."
+        rm -rf "${MAVEN_LOCAL_REPO}" 2>/dev/null || true
+    else
+        log_info "  Pruning Maven repo (removing downloads cache)..."
+        rm -rf "${MAVEN_LOCAL_REPO}/_remote.repositories" 2>/dev/null || true
+        find "${MAVEN_LOCAL_REPO}" -name "*.lastUpdated" -delete 2>/dev/null || true
+        find "${MAVEN_LOCAL_REPO}" -name "_maven.repositories" -delete 2>/dev/null || true
+    fi
+
+    # Clean Gradle caches
+    log_info "  Removing Gradle cache..."
+    rm -rf "${GRADLE_USER_HOME}/caches" 2>/dev/null || true
+    rm -rf "${GRADLE_USER_HOME}/daemon" 2>/dev/null || true
+    rm -rf "${GRADLE_USER_HOME}/wrapper" 2>/dev/null || true
+
+    # Clean temp files
+    rm -rf /tmp/s2i-maven-settings.xml 2>/dev/null || true
+    rm -rf /tmp/hsperfdata_* 2>/dev/null || true
+}
+
+cleanup_source() {
+    if [ "${S2I_DELETE_SOURCE}" = "true" ]; then
+        log_info "Removing source code..."
+        rm -rf "${S2I_SOURCE_DIR:?}"/* 2>/dev/null || true
+    fi
+}
+
+restore_artifacts() {
+    if [ -d "${S2I_ARTIFACTS_DIR}/m2" ]; then
+        log_info "Restoring Maven local repository from previous build..."
+        mkdir -p "$(dirname "${MAVEN_LOCAL_REPO}")"
+        if [ "${MAVEN_LOCAL_REPO}" != "${S2I_ARTIFACTS_DIR}/m2" ]; then
+            cp -rp "${S2I_ARTIFACTS_DIR}/m2" "${MAVEN_LOCAL_REPO}" 2>/dev/null || true
+        fi
+    fi
+
+    if [ -d "${S2I_ARTIFACTS_DIR}/.gradle" ]; then
+        log_info "Restoring Gradle cache from previous build..."
+        mkdir -p "$(dirname "${GRADLE_USER_HOME}")"
+        if [ "${GRADLE_USER_HOME}" != "${S2I_ARTIFACTS_DIR}/.gradle" ]; then
+            cp -rp "${S2I_ARTIFACTS_DIR}/.gradle" "${GRADLE_USER_HOME}" 2>/dev/null || true
+        fi
+    fi
+}
+
+# ============================================================================
+# Main execution
+# ============================================================================
+
+mkdir -p "${S2I_TARGET_DEPLOYMENTS_DIR}"
+
+# Run pre-build hook if present
+if [ -x "${S2I_SOURCE_DIR}/.s2i/bin/pre-assemble" ]; then
+    log_info "Running pre-assemble hook..."
+    "${S2I_SOURCE_DIR}/.s2i/bin/pre-assemble"
+fi
+
+# Restore artifacts from previous build (incremental builds)
+restore_artifacts
+
+# Auto-detect build type
+HAS_POM=false
+HAS_GRADLE=false
+HAS_MVNW=false
+HAS_GRADLEW=false
+
+[ -f "${S2I_SOURCE_DIR}/pom.xml" ] && HAS_POM=true
+{ [ -f "${S2I_SOURCE_DIR}/build.gradle" ] || [ -f "${S2I_SOURCE_DIR}/build.gradle.kts" ]; } && HAS_GRADLE=true
+[ -f "${S2I_SOURCE_DIR}/mvnw" ] && HAS_MVNW=true
+[ -f "${S2I_SOURCE_DIR}/gradlew" ] && HAS_GRADLEW=true
+
+# Execute appropriate build
+if [ "${HAS_POM}" = "true" ]; then
+    if [ "${HAS_MVNW}" = "true" ]; then
+        log_info "Maven project detected (pom.xml + Maven Wrapper)"
+        build_maven_wrapper
+    else
+        log_info "Maven project detected (pom.xml)"
+        build_maven
+    fi
+    cleanup_maven_build_artifacts
+elif [ "${HAS_GRADLE}" = "true" ]; then
+    if [ "${HAS_GRADLEW}" = "true" ]; then
+        log_info "Gradle project detected (build.gradle + Gradle Wrapper)"
+        build_gradle_wrapper
+    else
+        log_info "Gradle project detected (build.gradle)"
+        build_gradle
+    fi
+    cleanup_gradle_build_artifacts
+elif [ "${HAS_MVNW}" = "true" ]; then
+    log_info "Maven Wrapper detected"
+    build_maven_wrapper
+    cleanup_maven_build_artifacts
+elif [ "${HAS_GRADLEW}" = "true" ]; then
+    log_info "Gradle Wrapper detected"
+    build_gradle_wrapper
+    cleanup_gradle_build_artifacts
+else
+    log_info "No build file detected, treating as binary deployment"
+    deploy_binaries
+fi
+
+# Post-build: copy config, cleanup EVERYTHING
+copy_configuration
+cleanup_source
+cleanup_build_cache
+
+log_info "Build completed successfully!"
+
+# Run post-build hook if present
+if [ -x "${S2I_SOURCE_DIR}/.s2i/bin/post-assemble" ]; then
+    log_info "Running post-assemble hook..."
+    "${S2I_SOURCE_DIR}/.s2i/bin/post-assemble"
+fi

@@ -1,0 +1,23 @@
+#!/bin/bash
+# ==============================================================================
+# S2I save-artifacts script for Java 17
+# Streams build artifacts (Maven/Gradle cache) to stdout for incremental builds
+# ==============================================================================
+set -eo pipefail
+
+MAVEN_LOCAL_REPO="${MAVEN_LOCAL_REPO:-/tmp/artifacts/m2}"
+GRADLE_USER_HOME="${GRADLE_USER_HOME:-/tmp/artifacts/.gradle}"
+
+# Save Maven local repository
+if [ -d "${MAVEN_LOCAL_REPO}" ] && [ "$(ls -A "${MAVEN_LOCAL_REPO}" 2>/dev/null)" ]; then
+    pushd "${MAVEN_LOCAL_REPO}" > /dev/null
+    tar cf - .
+    popd > /dev/null
+fi
+
+# Save Gradle cache
+if [ -d "${GRADLE_USER_HOME}" ] && [ "$(ls -A "${GRADLE_USER_HOME}" 2>/dev/null)" ]; then
+    pushd "${GRADLE_USER_HOME}" > /dev/null
+    tar cf - .
+    popd > /dev/null
+fi

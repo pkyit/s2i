@@ -1,0 +1,199 @@
+#!/bin/bash
+# ==============================================================================
+# S2I run script for Java 17
+# Launches the Java application with container-aware JVM settings
+# ==============================================================================
+set -eo pipefail
+
+JAVA_APP_DIR="${JAVA_APP_DIR:-/deployments}"
+
+log_info()  { echo "---> [INFO] $*"; }
+log_error() { echo "---> [ERROR] $*" >&2; }
+
+# ---- Check for custom run script ----
+if [ -f "${JAVA_APP_DIR}/bin/run.sh" ]; then
+    log_info "Starting application using bundled run.sh..."
+    exec "${JAVA_APP_DIR}/bin/run.sh" $*
+fi
+
+# ---- Check for pre-run hook ----
+if [ -x "${JAVA_APP_DIR}/.s2i/bin/pre-run" ]; then
+    log_info "Running pre-run hook..."
+    "${JAVA_APP_DIR}/.s2i/bin/pre-run"
+fi
+
+# ---- Detect JAR file ----
+detect_jar() {
+    cd "${JAVA_APP_DIR}"
+
+    # If JAVA_MAIN_CLASS is set, skip JAR detection
+    if [ -n "${JAVA_MAIN_CLASS}" ]; then
+        log_info "Using main class: ${JAVA_MAIN_CLASS}"
+        return 0
+    fi
+
+    # If JAVA_APP_JAR is explicitly set, validate it
+    if [ -n "${JAVA_APP_JAR}" ]; then
+        if [ ! -f "${JAVA_APP_JAR}" ]; then
+            log_error "Specified JAVA_APP_JAR not found: ${JAVA_APP_JAR}"
+            exit 1
+        fi
+        return 0
+    fi
+
+    # Auto-detect: find JAR files (exclude known non-executable jars)
+    local jars=()
+    while IFS= read -r jar; do
+        [ -n "${jar}" ] && jars+=("${jar}")
+    done < <(find . -maxdepth 1 -name "*.jar" \
+        ! -name "original-*" \
+        ! -name "*-sources.jar" \
+        ! -name "*-javadoc.jar" \
+        ! -name "*-plain.jar" \
+        -print | sort)
+
+    local nr_jars=${#jars[@]}
+
+    if [ ${nr_jars} -eq 1 ]; then
+        JAVA_APP_JAR="${JAVA_APP_DIR}/${jars[0]#./}"
+        log_info "Auto-detected JAR: $(basename ${JAVA_APP_JAR})"
+        export JAVA_APP_JAR
+        return 0
+    elif [ ${nr_jars} -eq 0 ]; then
+        log_error "No JAR files found in ${JAVA_APP_DIR}"
+        log_error "Set JAVA_APP_JAR or JAVA_MAIN_CLASS environment variable"
+        exit 1
+    else
+        log_error "Multiple JAR files found in ${JAVA_APP_DIR} (${nr_jars}):"
+        for j in "${jars[@]}"; do
+            log_error "  - ${j#./}"
+        done
+        log_error "Set JAVA_APP_JAR environment variable to specify which to run"
+        exit 1
+    fi
+}
+
+# ---- Compute JVM Options ----
+compute_jvm_opts() {
+    local opts=""
+
+    # Container-aware memory settings
+    local max_mem_opt=$(max_memory)
+    if [ -n "${max_mem_opt}" ]; then
+        opts="${opts} ${max_mem_opt}"
+    fi
+
+    # GC settings
+    opts="${opts} $(gc_options)"
+
+    # Diagnostics
+    opts="${opts} $(diagnostics_options)"
+
+    # Remote debugging
+    opts="${opts} $(debug_options)"
+
+    # User-provided JVM options
+    if [ -n "${JAVA_OPTS}" ]; then
+        opts="${JAVA_OPTS}"
+    fi
+
+    if [ -n "${JAVA_OPTS_APPEND}" ]; then
+        opts="${opts} ${JAVA_OPTS_APPEND}"
+    fi
+
+    echo "${opts}" | xargs  # normalize whitespace
+}
+
+max_memory() {
+    # Skip if explicitly disabled
+    if [ "${JAVA_MAX_MEM_RATIO}" = "0" ]; then
+        return
+    fi
+
+    local ratio="${JAVA_MAX_MEM_RATIO:-80}"
+
+    # Try to read container memory limit from cgroups
+    local max_mem=""
+    if [ -f /sys/fs/cgroup/memory.max ]; then
+        # cgroup v2
+        max_mem=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+    elif [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        # cgroup v1
+        max_mem=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+    fi
+
+    # If we got a valid number, use MaxRAMPercentage
+    if [ -n "${max_mem}" ] && [ "${max_mem}" != "max" ] && [ "${max_mem}" -gt 0 ] 2>/dev/null; then
+        echo "-XX:MaxRAMPercentage=${ratio}.0"
+    fi
+
+    # Initial heap
+    if [ -n "${JAVA_INIT_MEM_RATIO}" ] && [ "${JAVA_INIT_MEM_RATIO}" != "0" ]; then
+        echo "-XX:InitialRAMPercentage=${JAVA_INIT_MEM_RATIO}.0"
+    fi
+}
+
+gc_options() {
+    local gc_opts="${GC_CONTAINER_OPTIONS:--XX:+UseParallelGC}"
+    gc_opts="${gc_opts} -XX:MinHeapFreeRatio=${GC_MIN_HEAP_FREE_RATIO:-10}"
+    gc_opts="${gc_opts} -XX:MaxHeapFreeRatio=${GC_MAX_HEAP_FREE_RATIO:-20}"
+    gc_opts="${gc_opts} -XX:GCTimeRatio=${GC_TIME_RATIO:-4}"
+    gc_opts="${gc_opts} -XX:AdaptiveSizePolicyWeight=${GC_ADAPTIVE_SIZE_POLICY_WEIGHT:-90}"
+
+    if [ -n "${GC_METASPACE_SIZE}" ]; then
+        gc_opts="${gc_opts} -XX:MetaspaceSize=${GC_METASPACE_SIZE}m"
+    fi
+    if [ -n "${GC_MAX_METASPACE_SIZE}" ]; then
+        gc_opts="${gc_opts} -XX:MaxMetaspaceSize=${GC_MAX_METASPACE_SIZE}m"
+    fi
+
+    echo "${gc_opts}"
+}
+
+diagnostics_options() {
+    local diag_opts="-XX:+ExitOnOutOfMemoryError"
+
+    if [ -n "${JAVA_DIAGNOSTICS}" ]; then
+        diag_opts="${diag_opts} -XX:+HeapDumpOnOutOfMemoryError"
+        diag_opts="${diag_opts} -XX:HeapDumpPath=${JAVA_APP_DIR}/heapdump.hprof"
+        diag_opts="${diag_opts} -Xlog:gc*:file=${JAVA_APP_DIR}/gc.log:time,uptime,level,tags:filecount=5,filesize=10m"
+    fi
+
+    echo "${diag_opts}"
+}
+
+debug_options() {
+    if [ -n "${JAVA_DEBUG}" ]; then
+        local suspend="${JAVA_DEBUG_SUSPEND:-n}"
+        local port="${JAVA_DEBUG_PORT:-5005}"
+        echo "-agentlib:jdwp=transport=dt_socket,server=y,suspend=${suspend},address=*:${port}"
+        log_info "Remote debugging enabled on port ${port} (suspend=${suspend})"
+    fi
+}
+
+# ============================================================================
+# Main: detect JAR, compute options, launch
+# ============================================================================
+
+detect_jar
+
+JVM_OPTS=$(compute_jvm_opts)
+
+# Determine how to launch the application
+local_args=""
+if [ -n "${JAVA_MAIN_CLASS}" ]; then
+    local_args="${JAVA_MAIN_CLASS}"
+elif [ -n "${JAVA_APP_JAR}" ]; then
+    local_args="-jar ${JAVA_APP_JAR}"
+fi
+
+log_info "============================================"
+log_info "Starting Java application"
+log_info "  Java: $(java -version 2>&1 | head -1)"
+log_info "  JVM Options: ${JVM_OPTS}"
+log_info "  Application: ${local_args}"
+log_info "  App Args: ${JAVA_ARGS} $*"
+log_info "============================================"
+
+cd "${JAVA_APP_DIR}"
+exec java ${JVM_OPTS} ${local_args} ${JAVA_ARGS} "$@"

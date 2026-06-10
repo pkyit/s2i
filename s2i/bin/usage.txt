@@ -1,0 +1,56 @@
+S2I Java 17 Builder Image
+=========================
+
+This image serves as an S2I (Source-to-Image) builder for Java 17 applications.
+It supports Maven, Gradle, and pre-built binary deployments.
+
+Build Tool Detection (auto-detected in order):
+  1. pom.xml present             -> Maven build (or Maven Wrapper if mvnw exists)
+  2. build.gradle(.kts) present  -> Gradle build (or Gradle Wrapper if gradlew exists)
+  3. mvnw present                -> Maven Wrapper build
+  4. gradlew present             -> Gradle Wrapper build
+  5. No build file               -> Binary deployment (copies pre-built JAR/WAR)
+
+Build Environment Variables:
+  MAVEN_ARGS              Override default Maven arguments
+  MAVEN_ARGS_APPEND       Append additional arguments to Maven
+  MAVEN_OPTS              JVM options for the Maven build process
+  MAVEN_S2I_GOALS         Maven goals to execute (default: package)
+  MAVEN_S2I_ARTIFACT_DIRS Directories to scan for build output (default: target)
+  MAVEN_CLEAR_REPO        Delete Maven local repo after build (default: false)
+  MAVEN_MIRROR_URL        URL for Maven repository mirror
+  MAVEN_MIRROR_OF         Maven mirror-of pattern (default: external:*)
+  GRADLE_ARGS             Override default Gradle arguments
+  GRADLE_ARGS_APPEND      Append additional arguments to Gradle
+  GRADLE_S2I_TASKS        Gradle tasks to execute (default: build)
+  S2I_DELETE_SOURCE       Delete source files after build (default: true)
+
+Runtime Environment Variables:
+  JAVA_APP_DIR            Application directory (default: /deployments)
+  JAVA_APP_JAR            JAR file to run (auto-detected if not set)
+  JAVA_MAIN_CLASS         Main class to run (alternative to JAR mode)
+  JAVA_OPTS               JVM options (overrides auto-computed defaults)
+  JAVA_OPTS_APPEND        Append to auto-computed JVM options
+  JAVA_ARGS               Arguments passed to the application
+  JAVA_MAX_MEM_RATIO      Max heap as % of container memory (default: 80)
+  JAVA_INIT_MEM_RATIO     Initial heap as % of container memory
+  JAVA_DEBUG              Enable remote debugging (set to non-empty)
+  JAVA_DEBUG_PORT         Debug port (default: 5005)
+  JAVA_DEBUG_SUSPEND      Suspend until debugger attaches (default: n)
+  JAVA_DIAGNOSTICS        Enable heap dump and GC logging (set to non-empty)
+  GC_CONTAINER_OPTIONS    GC options (default: -XX:+UseParallelGC)
+
+Usage:
+  s2i build <source-url> <builder-image> <output-image>
+
+Example:
+  # Build from a Git repository
+  s2i build https://github.com/spring-projects/spring-petclinic.git \
+    registry.cn-hangzhou.aliyuncs.com/pkyit/s2i:java17 my-app
+
+  # Build from local directory
+  s2i build /path/to/source \
+    registry.cn-hangzhou.aliyuncs.com/pkyit/s2i:java17 my-app
+
+  # Run the resulting image
+  docker run -p 8080:8080 my-app
